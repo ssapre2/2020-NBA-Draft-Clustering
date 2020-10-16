@@ -1,0 +1,415 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r message=FALSE, warning=FALSE}
+library(RSQLite)
+library(tidyverse)
+set.seed(42)
+conn = dbConnect(SQLite(), "ncaab")
+# Filter out those who didn't play much and change height units to inches, remove duplicate rows
+ncaa = read.csv("data/NCAA.csv")
+
+# Read in draft data scraped from BR-ref.com and only take players from 2006 or earlier
+draft = read.csv("data/Draft.csv") %>% rename("name" = "Player","team" = "School.Country") %>% filter(Year >= 2006)
+# Get all individual NBA stats from 2010 and beyond, only guards/smaller wings
+nba = read.csv("data/NBA.csv") %>% filter(Year >= 2010, Pos %in% c("PG", "SG","SF"))
+
+```
+
+### Get only players who played in the NBA as well as this upcoming draft class
+
+```{r}
+prospects = c("Anthony Edwards", "Tyrese Haliburton","Kira Lewis Jr.", "Josh Green", "Cole Anthony", "Tyrese Maxey", "Tyrell Terry", "Grant Riller", "Nico Mannion", "Malachi Flynn", "Cassius Winston", "Aaron Nesmith", "Jahmius Ramsey","Devon Dotson","Elijah Hughes","Immanuel Quickley", "CJ Elleby", "Isaiah Joe", "Cassius Stanley", "Tre Jones", "Payton Pritchard", "Ashton Hagans","Nate Hinton", "Markus Howard", "Desmond Bane", "Robert Woodard", "Saben Lee") 
+#prospects = ncaa %>% filter(season == "2019-20", position == "Guard", height <= 78, games_started >= 20) %>% select(name) %>% unlist(use.names = F)
+```
+
+
+```{r}
+# Get the names of all current NBA players
+nba$Player %>% unique() -> nba.players
+# Get 2019 Class and add it to pool of players along with 2020 class
+draft %>% filter(Year == 2019) %>% select(name) %>% unlist(use.names = F) %>% c(nba.players,prospects) -> nba.players
+# Get college stats of chosen NBA players
+intersect(nba.players, unique(ncaa$name)) -> use.players
+ncaa %>% filter(name %in% use.players, height <= 78) -> player
+player %>% group_by(name, team, position) %>% summarise_all(last) %>%  ungroup() -> player
+```
+
+
+# Missing Values
+
+Looks like earlier years had some issues with advanced stats that we may use, therefore it may make sense to impute or drop them all together.
+
+```{r}
+library(naniar)
+# Create a dataframe specifically to visualize NAs
+player %>% filter(position=="Guard") -> guard.na
+# Visualize the NAs in that dataframe
+gg_miss_fct(x = guard.na, fct = year)
+```
+
+
+
+```{r}
+# Get rid of those that do not have DBPM and visualize them and make sure the only position used in 'Guards'
+guards = player %>% filter(position == "Guard", games_played >= 20) %>% drop_na(defensive_box_plus_minus)
+gg_miss_var(guards) + labs(title = "Missing Values by Variable")
+# Drop players without a height value
+player = player %>% drop_na(height)
+na.omit(player) -> player
+```
+
+
+```{r}
+# Get data ready for correlation matrix by only taking numeric columns
+player %>% filter(position == "Guard") %>% select_if(is.numeric) %>%
+  select(-c(games_played,games_started,minutes_played)) -> x
+```
+
+
+```{r}
+library(corrplot)
+corrmat = cor(scale(x))
+corrplot(corrmat,order = "hclust", type = "upper", sig.level =  0.01)
+```
+
+Okay, so this is clearly a lot. How can we reduce the number of dimensions in the dimensions to make things 
+
+
+```{r}
+corrmat["defensive_win_shares",] %>% sort(decreasing = T)
+```
+
+
+
+Let's break down where we can get rid of variables by what skills they show us
+
+
+
+
+
+Get rid of most all-in-one and volume stats 
+
+
+```{r}
+# Drop columns associated with counting stats, or that don't account for guard playing style
+rebs = player %>% select(contains("rebound")) %>% colnames()
+drop.cols = c(rebs,'field_goal_attempts','points','win_shares','box_plus_minus','two_point_attempts','free_throw_attempts','field_goals','two_pointers','free_throws', 'personal_fouls',"total_rebound_percentage", 'offensive_win_shares','player_efficiency_rating','win_shares_per_40_minutes','true_shooting_percentage','field_goal_percentage','three_point_attempts','turnovers','steals',"three_pointers","offensive_box_plus_minus","assists","blocks","free_throw_percentage","block_percentage","defensive_win_shares","steal_percentage", "weight", "two_point_percentage","free_throw_attempt_rate","three_point_percentage","total_rebound_percentage", "true_shooting_percentage", "height","year", "turnover_percentage","ft","X","points_produced")
+x %>% select(-drop.cols)-> new.x
+
+
+
+# New Correlations
+cor(new.x)
+cor(new.x) %>% corrplot(order = "hclust", type = "upper", sig.level =  0.01)
+
+```
+
+
+Hierarchical Clustering
+
+
+```{r}
+# Function to normalize data
+normalize <- function(x) {
+return ((x - min(x)) / (max(x) - min(x)))
+}
+
+```
+
+
+
+```{r}
+# Calculate correlation-based distance
+dd = as.dist(1-cor(t(scale(new.x))))
+# Calculate "complete" linkage
+cor.complete = hclust(dd, method="complete")
+# Calculate "average" linkage
+cor.average = hclust(dd, method = "average")
+# Plot "average" linkage 
+plot(cor.average, main = "Average: correlation-based distance", xlab = "", labels = F)
+# Plot "complete" linkage
+plot(cor.complete,main = "Complete: correlation-based distance",xlab = "",labels = F)
+```
+
+
+
+
+# Create 5 clusters from dendrogram
+```{r}
+avg.clusters = cutree(cor.average, k = 6)
+```
+
+
+```{r}
+# Pick Guards only and assign clusters to data frame
+guards = player %>% filter(position == "Guard") %>% mutate(avg.cluster = avg.clusters)
+#Join Draft data to college stats
+guards = left_join(guards,draft[,c("name","Pick","team")], by = c("name","team"))
+# If the draft info for that player is unavailable, assume undrafted and label the pick# as 61
+guards$Pick[is.na(guards$Pick)] <- 61
+guards$Pick[guards$Pick > 61] <- 61
+# If the player's last season was the most recent one, label as 0 - current draft prospect
+guards$Pick[guards$year == 2020] <- 61
+# Let's see the qualities of each group
+guards %>% select(colnames(new.x),avg.cluster) %>% group_by(avg.cluster) %>% summarise_each(mean) -> group_means
+group_means
+```
+
+
+```{r}
+guards %>% filter(avg.cluster == 1) %>% select(name,year,team, Pick,colnames(new.x)) %>% group_by(year)%>% arrange(Pick)
+```
+
+
+```{r}
+guards %>% filter(year == 2020) %>% select(name,year,team, avg.cluster, colnames(new.x)) %>% group_by(avg.cluster)
+```
+
+
+
+
+## Graphs and Viz
+
+
+```{r}
+# Normalize data
+guards$avg.cluster = as.factor(guards$avg.cluster)
+guards %>% mutate_if(is.numeric, normalize) -> norm.data
+norm.data %>% select(colnames(new.x),avg.cluster) %>% group_by(avg.cluster) %>% summarise_each(mean)
+
+# Normalize group means
+group_means$avg.cluster = as.factor(group_means$avg.cluster) 
+group_means %>% mutate_if(is.numeric, normalize) -> group.norm
+
+group.norm
+# Create Radar Charts in Excel
+#write.csv(group.norm, file = "grouped_norm.csv")
+```
+
+
+
+
+```{r}
+library(ggthemes)
+## LOLLIPOP CHARTS for 1 
+
+library(reshape2)
+# Clean up column names a bit
+colnames(group.norm) = colnames(group.norm) %>% gsub(pattern = "_",replacement = " ")
+# Melt dataframe to make it suitable for graphing and then GRAPH
+melt(group.norm,id.vars = 'avg.cluster') %>% arrange(value) -> melt.norm
+
+# Melted 'mean' data
+colnames(group_means) = colnames(group_means) %>% gsub(pattern = "_",replacement = " ")
+group_means %>% melt(id.vars = "avg.cluster") %>% arrange(value) -> melt.mean
+
+# Get normalized and unscaled data
+inner_join(melt.norm, melt.mean, by = c("avg.cluster","variable")) -> melt.total
+```
+
+
+```{r}
+melt.total %>% filter(avg.cluster == 1) %>% ggplot(aes(x = variable, y = value.x, label = round(value.y,digits = 2)))+
+    geom_segment( aes(x=variable ,xend=variable, y=0, yend=value.x), color="grey") +
+    geom_point(size=10, color="#69b3a2") +
+    coord_flip() +
+  geom_text(color = 'white', size = 3) +
+    theme(
+      panel.grid.minor.y = element_blank(),
+      panel.grid.major.y = element_blank(),
+      legend.position="none",
+      axis.ticks.x=element_blank(),
+      axis.text.x=element_blank()
+    ) +
+    ylim(0,1) +
+    labs(title = "Low Efficiency 3-and-D Guards",caption = "", y = "",x = "", subtitle = "Group Averages") 
+```
+
+
+
+
+```{r}
+melt.total %>% filter(avg.cluster == 2) %>% ggplot(aes(x = variable, y = value.x, label = round(value.y,digits = 2)))+
+    geom_segment( aes(x=variable ,xend=variable, y=0, yend=value.x), color="grey") +
+    geom_point(size=10, color="#69b3a2") +
+    coord_flip() +
+  geom_text(color = 'white', size = 3) +
+    theme(
+      panel.grid.minor.y = element_blank(),
+      panel.grid.major.y = element_blank(),
+      legend.position="none",
+      axis.ticks.x=element_blank(),
+      axis.text.x=element_blank()
+    ) +
+    ylim(0,1) +
+    labs(title = "Floor Generals", y = "",x = "", subtitle = "Group Averages") 
+```
+
+
+
+
+
+```{r}
+melt.total %>% filter(avg.cluster == 3) %>% ggplot(aes(x = variable, y = value.x, label = round(value.y,digits = 2)))+
+    geom_segment( aes(x=variable ,xend=variable, y=0, yend=value.x), color="grey") +
+    geom_point(size=10, color="#69b3a2") +
+    coord_flip() +
+  geom_text(color = 'white', size = 3) +
+    theme(
+      panel.grid.minor.y = element_blank(),
+      panel.grid.major.y = element_blank(),
+      legend.position="none",
+      axis.ticks.x=element_blank(),
+      axis.text.x=element_blank()
+    ) +
+    ylim(0,1) +
+    labs(title = "High Volume Scorers",y = "",x = "", subtitle = "Group Averages") 
+```
+
+
+
+
+```{r}
+melt.total %>% filter(avg.cluster == 4) %>% ggplot(aes(x = variable, y = value.x, label = round(value.y,digits = 2)))+
+    geom_segment( aes(x=variable ,xend=variable, y=0, yend=value.x), color="grey") +
+    geom_point(size=10, color="#69b3a2") +
+    coord_flip() +
+  geom_text(color = 'white', size = 3) +
+    theme(
+      panel.grid.minor.y = element_blank(),
+      panel.grid.major.y = element_blank(),
+      legend.position="none",
+      axis.ticks.x=element_blank(),
+      axis.text.x=element_blank()
+    ) +
+    ylim(0,1) +
+    labs(title = "Offensive Focal Points", y = "",x = "", subtitle = "Group Averages") 
+```
+
+
+
+
+
+```{r}
+melt.total %>% filter(avg.cluster == 5) %>% ggplot(aes(x = variable, y = value.x, label = round(value.y,digits = 2)))+
+    geom_segment( aes(x=variable ,xend=variable, y=0, yend=value.x), color="grey") +
+    geom_point(size=10, color="#69b3a2") +
+    coord_flip() +
+  geom_text(color = 'white', size = 3) +
+    theme(
+      panel.grid.minor.y = element_blank(),
+      panel.grid.major.y = element_blank(),
+      legend.position="none",
+      axis.ticks.x=element_blank(),
+      axis.text.x=element_blank()
+    ) +
+    ylim(0,1) +
+    labs(title = "Primary Ballhandlers with Lockdown D", y = "",x = "", subtitle = "Group Averages") 
+```
+
+
+
+
+
+
+```{r}
+melt.total %>% filter(avg.cluster == 6) %>% ggplot(aes(x = variable, y = value.x, label = round(value.y,digits = 2)))+
+    geom_segment( aes(x=variable ,xend=variable, y=0, yend=value.x), color="grey") +
+    geom_point(size=10, color="#69b3a2") +
+    coord_flip() +
+  geom_text(color = 'white', size = 3) +
+    theme(
+      panel.grid.minor.y = element_blank(),
+      panel.grid.major.y = element_blank(),
+      legend.position="none",
+      axis.ticks.x=element_blank(),
+      axis.text.x=element_blank()
+    ) +
+    ylim(0,1) +
+    labs(title = "Efficient 3 and D Wings", y = "",x = "", subtitle = "Group Averages") 
+```
+
+
+
+
+
+
+```{r}
+library(reshape2)
+# Clean up column names a bit
+colnames(group.norm) = colnames(group.norm) %>% gsub(pattern = "_",replacement = " ")
+# Melt dataframe to make it suitable for graphing and then GRAPH
+melt.total %>% ggplot(aes(x = variable, y = value.x))+ 
+    geom_segment( aes(x=variable ,xend=variable, y=0, yend=value.x), color="grey") +
+    geom_point(size=5, color="#69b3a2") +
+    facet_wrap(~avg.cluster) +
+    coord_flip() +
+    theme(
+      panel.grid.minor.y = element_blank(),
+      panel.grid.major.y = element_blank(),
+      legend.position="none",
+      axis.ticks.x=element_blank(),
+      axis.text.x=element_blank()
+    ) +
+    ylim(0,1) +
+    labs(title = "Characteristics of Each Cluster",caption = "Scores for each variable are relative", y = "",x = "") 
+    
+```
+
+
+
+
+
+# Individuals 
+
+```{r}
+norm.data %>% filter(name == "Tyrese Haliburton") %>% select(names(new.x)) %>% melt() %>% 
+  ggplot(aes(x = variable, y = value))+
+    geom_segment( aes(x=variable ,xend=variable, y=0, yend=value), color="grey") +
+    geom_point(size=10, color="#69b3a2") +
+    coord_flip() +
+    theme(
+      panel.grid.minor.y = element_blank(),
+      panel.grid.major.y = element_blank(),
+      legend.position="none",
+      axis.ticks.x=element_blank(),
+      axis.text.x=element_blank()
+    ) +
+    ylim(0,1) +
+    labs(title = "Tyrese Haliburton", y = "",x = "") 
+    
+```
+
+
+
+
+
+
+```{r}
+norm.data %>% filter(name == "Anthony Edwards") %>% select(names(new.x)) %>% melt() %>% 
+  ggplot(aes(x = variable, y = value))+
+    geom_segment( aes(x=variable ,xend=variable, y=0, yend=value), color="grey") +
+    geom_point(size=10, color="#69b3a2") +
+    coord_flip() +
+    theme(
+      panel.grid.minor.y = element_blank(),
+      panel.grid.major.y = element_blank(),
+      legend.position="none",
+      axis.ticks.x=element_blank(),
+      axis.text.x=element_blank()
+    ) +
+    ylim(0,1) +
+    labs(title = "Anthony Edwards", y = "",x = "") 
+    
+```
+
+
+
+
+
+
